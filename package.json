@@ -4,8 +4,15 @@
   "description": "Minimal pi extension: connect a local OmniRoute gateway as a real OpenAI-compatible provider.",
   "license": "MIT",
   "type": "commonjs",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "omniroute",
+    "openai-compatible"
+  ],
   "files": [
-    "omniroute.ts",
+    "extensions",
     "README.md",
     "LICENSE"
   ],

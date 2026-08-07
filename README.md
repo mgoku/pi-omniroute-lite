@@ -22,11 +22,21 @@ otherwise).
 
 ## Install
 
+### Option A — pi package manager (recommended)
+
+```bash
+pi install npm:pi-omniroute-lite
+```
+
+pi discovers the `extensions/` directory automatically. Restart pi (or `/reload`).
+
+### Option B — manual clone
+
 ```bash
 git clone https://github.com/mgoku/pi-omniroute-lite.git
 cd pi-omniroute-lite
-npm install        # installs dev deps (typescript) for type-checking
-npm run install-ext   # copies omniroute.ts -> ~/.pi/agent/extensions/
+npm install            # dev deps (typescript) for type-checking
+npm run install-ext    # copies extensions/omniroute.ts -> ~/.pi/agent/extensions/
 ```
 
 Restart pi (or `/reload`), then:

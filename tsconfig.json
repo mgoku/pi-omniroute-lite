@@ -9,5 +9,5 @@
     "esModuleInterop": true,
     "types": ["node"]
   },
-  "include": ["omniroute.ts"]
+  "include": ["extensions/omniroute.ts"]
 }

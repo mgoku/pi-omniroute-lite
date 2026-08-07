@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 const home = process.env.PI_HOME ?? homedir();
 const destDir = join(home, ".pi", "agent", "extensions");
-const src = new URL("../omniroute.ts", import.meta.url);
+const src = new URL("../extensions/omniroute.ts", import.meta.url);
 
 mkdirSync(destDir, { recursive: true });
 copyFileSync(src, join(destDir, "omniroute.ts"));

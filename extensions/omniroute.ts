@@ -24,17 +24,28 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "omni";
+const DEFAULT_BASE_URL = "http://localhost:20129/v1";
 const API = "openai-completions"; // real pi-core handler; fixes answer-mode crash
 const STATUS_KEY = "omni";
 const HEALTH_INTERVAL_MS = 60_000; // re-check every 60s while session is alive
 
+let cachedModelsJsonPath: string | undefined;
+
 function modelsJsonPath(): string {
+	// Only the positive result is cached: once ~/.pi/agent/models.json exists it
+	// won't stop existing, but the fallback must stay re-checkable so a file
+	// created mid-session (fresh install, pi migration) is still picked up.
+	if (cachedModelsJsonPath) return cachedModelsJsonPath;
 	const fs = require("node:fs");
 	const os = require("node:os");
 	const path = require("node:path");
 	const home = process.env.PI_HOME ?? os.homedir();
 	const candidate = path.join(home, ".pi", "agent", "models.json");
-	return fs.existsSync(candidate) ? candidate : path.join(home, ".pi", "models.json");
+	if (fs.existsSync(candidate)) {
+		cachedModelsJsonPath = candidate;
+		return candidate;
+	}
+	return path.join(home, ".pi", "models.json");
 }
 
 function readModelsJson(): any {
@@ -51,12 +62,10 @@ function writeModelsJson(config: any): void {
 	fs.writeFileSync(modelsJsonPath(), JSON.stringify(config, null, 2));
 }
 
-function getOmniUrl(): string {
-	return readModelsJson()?.providers?.[PROVIDER_ID]?.baseUrl ?? "http://localhost:20129/v1";
-}
-
-function getApiKey(): string {
-	return readModelsJson()?.providers?.[PROVIDER_ID]?.apiKey ?? "";
+/** The stored apiKey, with the keyless "dummy" sentinel normalized to "". */
+function realApiKey(provider: any): string {
+	const key = provider?.apiKey ?? "";
+	return key && key !== "dummy" ? key : "";
 }
 
 async function checkHealth(baseUrl: string, apiKey: string): Promise<boolean> {
@@ -65,6 +74,10 @@ async function checkHealth(baseUrl: string, apiKey: string): Promise<boolean> {
 			headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
 			signal: AbortSignal.timeout(5000),
 		});
+		// We only need the status. Discarding the (~15KB) body releases the socket
+		// back to the pool instead of letting it idle until GC — ~3x faster per
+		// probe, and this runs every 60s for the whole session.
+		void res.body?.cancel().catch(() => {});
 		return res.ok;
 	} catch {
 		return false;
@@ -112,6 +125,10 @@ function toModels(data: any[]): any[] {
 }
 
 let healthInterval: ReturnType<typeof setInterval> | undefined;
+/** Last known health, so suffix-only updates can repaint without a network probe. */
+let lastHealthy: boolean | undefined;
+/** Active omni model id, remembered so the 60s refresh doesn't wipe the suffix. */
+let activeOmniModelId: string | undefined;
 
 function setStatus(ctx: any, text: string | undefined) {
 	try {
@@ -121,30 +138,45 @@ function setStatus(ctx: any, text: string | undefined) {
 	}
 }
 
+/** Paint the status bar from already-known state. Never touches the network. */
+function renderStatus(ctx: any): void {
+	if (lastHealthy === undefined) return;
+	const suffix = activeOmniModelId ? ` → ${activeOmniModelId}` : "";
+	setStatus(ctx, lastHealthy ? `OmniRoute ✓${suffix}` : `OmniRoute ✗${suffix}`);
+}
+
 /**
- * Show OmniRoute health in the status bar.
+ * Probe OmniRoute and show health in the status bar.
  * - Unconfigured: no 'omni' provider yet
- * - ✓ healthy, ❌ unreachable
+ * - ✓ healthy, ✗ unreachable
  * - When an omni model is active, append the model id
+ *
+ * Callers must NOT await this on an event path: pi awaits extension handlers
+ * serially, so a blocked probe stalls the UI for the full 5s timeout.
  */
-async function refreshStatus(ctx: any, activeModelId?: string): Promise<void> {
-	const config = readModelsJson();
-	const provider = config.providers?.[PROVIDER_ID];
+async function refreshStatus(ctx: any): Promise<void> {
+	const provider = readModelsJson().providers?.[PROVIDER_ID];
 	if (!provider?.baseUrl) {
+		lastHealthy = undefined;
 		setStatus(ctx, undefined);
 		return;
 	}
-	const healthy = await checkHealth(provider.baseUrl, provider.apiKey && provider.apiKey !== "dummy" ? provider.apiKey : "");
-	const suffix = activeModelId ? ` → ${activeModelId}` : "";
-	setStatus(ctx, healthy ? `OmniRoute ✓${suffix}` : `OmniRoute ✗${suffix}`);
+	lastHealthy = await checkHealth(provider.baseUrl, realApiKey(provider));
+	renderStatus(ctx);
 }
 
 export default function omnirouteExtension(pi: ExtensionAPI) {
 	// Status-bar health check on every session start (startup, reload, resume, fork).
 	pi.on("session_start", async (_event, ctx) => {
-		await refreshStatus(ctx);
+		// Headless modes get a no-op setStatus, so probing would burn up to 5s of
+		// startup (and a 60s interval for the session lifetime) painting nothing.
+		if (ctx.mode !== "tui") return;
+		// Deliberately not awaited: pi awaits session_start handlers, and an
+		// unreachable gateway would otherwise delay startup by the full timeout.
+		void refreshStatus(ctx);
 		if (healthInterval) clearInterval(healthInterval);
-		healthInterval = setInterval(() => refreshStatus(ctx), HEALTH_INTERVAL_MS);
+		healthInterval = setInterval(() => void refreshStatus(ctx), HEALTH_INTERVAL_MS);
+		healthInterval.unref?.();
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -156,8 +188,17 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 
 	// Reflect the active omni model id once selected.
 	pi.on("model_select", async (event, ctx) => {
-		const id = event.model?.id;
-		await refreshStatus(ctx, id);
+		if (ctx.mode !== "tui") return; // no status bar to update
+		const isOmni = event.model?.provider === PROVIDER_ID;
+		const wasOmni = activeOmniModelId !== undefined;
+		// Switching between two non-omni models changes nothing we display.
+		if (!isOmni && !wasOmni) return;
+		activeOmniModelId = isOmni ? event.model?.id : undefined;
+		// Repaint instantly from cached health, then re-probe in the background.
+		// Awaiting the probe here would freeze every model switch (up to 5s when
+		// the gateway is unreachable) because pi awaits this handler.
+		renderStatus(ctx);
+		void refreshStatus(ctx);
 	});
 
 	pi.registerCommand("omniroute-setup", {
@@ -165,7 +206,7 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const urlInput = await ctx.ui.input(
 				"OmniRoute Base URL",
-				"e.g. http://localhost:20129/v1",
+				`e.g. ${DEFAULT_BASE_URL}`,
 			);
 			if (urlInput === undefined || !urlInput.trim()) return;
 			const baseUrl = urlInput.trim().replace(/\/+$/, "");
@@ -194,6 +235,8 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 				models: config.providers[PROVIDER_ID]?.models ?? [],
 			};
 			writeModelsJson(config);
+			lastHealthy = healthy;
+			renderStatus(ctx);
 
 			ctx.ui.notify(
 				`✅ Saved '${PROVIDER_ID}' provider (${baseUrl}) with api: ${API}.\n` +
@@ -206,8 +249,11 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 	pi.registerCommand("omniroute-sync", {
 		description: "Omniroute: pull /v1/models into Ctrl+P picker",
 		handler: async (_args, ctx) => {
-			const baseUrl = getOmniUrl();
-			const apiKey = getApiKey();
+			// Read the config exactly once. Three separate reads could observe three
+			// different on-disk states, and the same object is reused for the write.
+			const config = readModelsJson();
+			const baseUrl = config.providers?.[PROVIDER_ID]?.baseUrl ?? DEFAULT_BASE_URL;
+			const apiKey = realApiKey(config.providers?.[PROVIDER_ID]);
 
 			if (!baseUrl) {
 				ctx.ui.notify("No 'omni' provider found. Run /omniroute-setup first.", "error");
@@ -219,7 +265,7 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 			let data: any[];
 			try {
 				const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/models`, {
-					headers: apiKey && apiKey !== "dummy" ? { Authorization: `Bearer ${apiKey}` } : {},
+					headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
 					signal: AbortSignal.timeout(10000),
 				});
 				if (!res.ok) {
@@ -234,7 +280,6 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 			}
 
 			const models = toModels(data);
-			const config = readModelsJson();
 			config.providers ??= {};
 			config.providers[PROVIDER_ID] = {
 				baseUrl,

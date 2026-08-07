@@ -4,6 +4,9 @@
   "description": "Minimal pi extension: connect a local OmniRoute gateway as a real OpenAI-compatible provider.",
   "license": "MIT",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -18,12 +21,13 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run typecheck",
     "install-ext": "node scripts/install.mjs",
     "dev": "node scripts/dev.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@types/node": "^22.0.0",
+    "@types/node": "^24.0.0",
     "typescript": "^5.6.0"
   },
   "peerDependencies": {

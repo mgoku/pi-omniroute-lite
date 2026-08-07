@@ -11,6 +11,11 @@ const home = process.env.PI_HOME ?? homedir();
 const destDir = join(home, ".pi", "agent", "extensions");
 const src = new URL("../extensions/omniroute.ts", import.meta.url);
 
+if (!existsSync(src)) {
+	console.error(`✖ extension not found at ${src}`);
+	process.exit(1);
+}
+
 mkdirSync(destDir, { recursive: true });
 copyFileSync(src, join(destDir, "omniroute.ts"));
 

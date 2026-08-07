@@ -15,10 +15,11 @@ to pi as a plain **OpenAI-compatible provider**.
 - **Every synced model must carry a `cost` object** — pi-core's model override path reads
   `model.cost.tiers` and throws `Cannot read properties of undefined (reading 'tiers')` when
   `cost` is missing. `toModels()` in `extensions/omniroute.ts` guarantees this; never remove it.
-- **Compiled from TypeScript for speed.** The extension is compiled (build step), not loaded as
-  raw `.ts` — TypeScript is a dev dependency used for compiling and typechecking. Don't add
-  *runtime* npm dependencies: stick to Node built-ins (`node:fs`, `node:os`, `node:path`, global
-  `fetch`, `AbortSignal`).
+- **Raw TypeScript, no build step.** pi loads the extension's `.ts` source directly at runtime via
+  jiti (auto-discovery watches `~/.pi/agent/extensions/*.ts`), so there is no compile or emit
+  step — TypeScript is a dev dependency used for typechecking only. Don't add *runtime* npm
+  dependencies: stick to Node built-ins (`node:fs`, `node:os`, `node:path`, global `fetch`,
+  `AbortSignal`).
 - **The repo's `extensions/omniroute.ts` is the only source of truth.** Anything under
   `~/.pi/agent/extensions/` (or any other `~/.pi` path) is a copied artifact, overwritten by
   `npm run install-ext` — never edit it directly.

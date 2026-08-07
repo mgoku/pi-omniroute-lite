@@ -42,4 +42,14 @@ const result = spawnSync(
 	},
 );
 
+if (result.error) {
+	console.error(`✖ failed to run pi: ${result.error.message}`);
+	if (result.error.code === "ENOENT") {
+		console.error(
+			"  pi is not installed or not on PATH. Install it from https://pi.dev",
+		);
+	}
+	process.exit(1);
+}
+
 process.exit(result.status ?? 1);

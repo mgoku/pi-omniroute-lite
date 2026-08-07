@@ -1,0 +1,28 @@
+{
+  "name": "pi-omniroute-lite",
+  "version": "1.0.0",
+  "description": "Minimal pi extension: connect a local OmniRoute gateway as a real OpenAI-compatible provider.",
+  "license": "MIT",
+  "type": "commonjs",
+  "files": [
+    "omniroute.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "install-ext": "node scripts/install.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mgoku/pi-omniroute-lite.git"
+  }
+}

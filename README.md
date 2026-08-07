@@ -1,15 +1,8 @@
 # pi-omniroute-lite
 
-A minimal, dependency-free [pi](https://pi.dev) extension that connects a local
+A minimal [pi](https://pi.dev) extension that connects a local
 [OmniRoute](https://github.com/mgoku/omniroute) gateway to pi as a plain
 OpenAI-compatible provider.
-
-It replaces the upstream `omniroute-pi-ext-integration` package, which stamps a
-fake `api: "omni-prompt-tools"` into `~/.pi/agent/models.json` and breaks
-`fetch_content` **answer mode** ("No API provider registered"). This extension
-only ever writes the real `api: "openai-completions"`, and makes sure every
-synced model carries a `cost` object (pi-core throws on `model.cost.tiers`
-otherwise).
 
 ## Features
 
@@ -52,8 +45,8 @@ Restart pi (or `/reload`), then:
 npm run typecheck    # type-check omniroute.ts against pi's types
 ```
 
-The extension is plain TypeScript; pi loads `*.ts` directly from
-`~/.pi/agent/extensions/`, so no build step is required.
+The extension is plain TypeScript (no runtime dependencies — TypeScript is a
+dev dependency).
 
 ## License
 

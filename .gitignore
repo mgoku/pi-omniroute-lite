@@ -2,3 +2,4 @@ node_modules/
 .pi-dev-home/
 *.log
 .DS_Store
+.codegraph/

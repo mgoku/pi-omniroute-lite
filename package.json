@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "install-ext": "node scripts/install.mjs"
+    "install-ext": "node scripts/install.mjs",
+    "dev": "node scripts/dev.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",

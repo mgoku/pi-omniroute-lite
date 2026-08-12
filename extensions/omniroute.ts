@@ -84,6 +84,15 @@ async function checkHealth(baseUrl: string, apiKey: string): Promise<boolean> {
 	}
 }
 
+/**
+ * OmniRoute's /v1/models returns wrong context/max-token values for some models.
+ * These overrides stamp the correct values during sync. Keyed by model id.
+ * contextWindow = total context; maxTokens = max output tokens.
+ */
+const MODEL_OVERRIDES: Record<string, { contextWindow?: number; maxTokens?: number }> = {
+	"oc/deepseek-v4-flash-free": { contextWindow: 200000, maxTokens: 131072 },
+};
+
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
 function toModels(data: any[]): any[] {
 	const out: any[] = [];
@@ -117,6 +126,14 @@ function toModels(data: any[]): any[] {
 
 		if (m.capabilities?.tool_calling === false) entry.tool_calling = false;
 		if (m.capabilities?.reasoning || m.capabilities?.thinking) entry.reasoning = true;
+
+		// Apply known-correct values for models where OmniRoute reports bad data.
+		const override = MODEL_OVERRIDES[id];
+		if (override) {
+			if (override.contextWindow !== undefined)
+				entry.contextWindow = override.contextWindow;
+			if (override.maxTokens !== undefined) entry.maxTokens = override.maxTokens;
+		}
 
 		out.push(entry);
 	}

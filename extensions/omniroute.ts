@@ -59,7 +59,13 @@ function readModelsJson(): any {
 
 function writeModelsJson(config: any): void {
 	const fs = require("node:fs");
-	fs.writeFileSync(modelsJsonPath(), JSON.stringify(config, null, 2));
+	const path = require("node:path");
+	const file = modelsJsonPath();
+	// Ensure the parent dir exists: on a fresh setup (or the older .pi/models.json
+	// fallback layout) pi may not have created it yet, and writeFileSync would
+	// otherwise throw ENOENT.
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, JSON.stringify(config, null, 2));
 }
 
 /** The stored apiKey, with the keyless "dummy" sentinel normalized to "". */
@@ -305,6 +311,12 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 				models,
 			};
 			writeModelsJson(config);
+
+			// A successful sync proves the gateway is reachable, so repaint the
+			// status bar from the known-good state instead of waiting for the next
+			// 60s timer tick to clear a stale ✗.
+			lastHealthy = true;
+			if (ctx.mode === "tui") renderStatus(ctx);
 
 			try {
 				ctx.modelRegistry.refresh();

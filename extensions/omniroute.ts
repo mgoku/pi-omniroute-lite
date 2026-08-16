@@ -100,21 +100,6 @@ const MODEL_OVERRIDES: Record<string, { contextWindow?: number; maxTokens?: numb
 };
 
 /**
- * Reasoning-effort tiers per model, keyed by model id. pi's default is to
- * expose off/minimal/low/medium/high for every reasoning model and send the raw
- * level as `reasoning_effort` — but some models accept only a subset and reject
- * the rest (qwen3.8-max 400s on `high`; it only takes `low`/`medium`/`xhigh`).
- * An entry maps pi's levels to what the model accepts: a string is the exact
- * value sent, `null` hides the level from the selector and skips it when
- * cycling. Values below mirror pi's own catalog entry for qwen3.8-max.
- */
-const THINKING_LEVEL_OVERRIDES: Record<string, Record<string, string | null>> = {
-	// gateway doesn't publish effort_tiers for these, so pin them manually
-	"charm-hyper/qwen3.8-max": { minimal: null, high: null, max: null, low: "low", medium: "medium", xhigh: "xhigh" },
-	"trk/qwen/qwen3.8-max-free": { minimal: null, high: null, max: null, low: "low", medium: "medium", xhigh: "xhigh" },
-};
-
-/**
  * Convert OmniRoute `capabilities.effort_tiers` ("none" | "low" | "medium" |
  * "high" | "xhigh") into a pi `thinkingLevelMap`. Listed tiers map 1:1 to
  * their own name ("none" means off is supported, so it keeps pi's default
@@ -137,6 +122,121 @@ function thinkingLevelMapFromTiers(tiers: unknown): Record<string, string | null
 		map[level] = tiersSet.has(level) ? level : null;
 	}
 	return map;
+}
+
+// ---- built-in catalog fallback ---------------------------------------------
+// When the gateway publishes no effort_tiers, look the model up in pi's own
+// provider catalogs (@earendil-works/pi-ai/dist/providers/data/*.json) and
+// inherit its thinkingLevelMap. This reuses the same source pi trusts for its
+// own providers (e.g. glm-5.2 => high/max, hy3 => low/high) instead of
+// guessing with the default off/low/medium/high list.
+
+let piCatalogDir: string | null | undefined; // undefined = not probed yet
+let piCatalogMaps: Record<string, Record<string, string | null>> | undefined;
+
+/** Locate pi-ai's provider catalogs by walking up from the `pi` binary. */
+function findPiCatalogDir(): string | null {
+	if (piCatalogDir !== undefined) return piCatalogDir;
+	const fs = require("node:fs");
+	const path = require("node:path");
+	const cp = require("node:child_process");
+	const walkUp = (start: string): string | null => {
+		let dir = start;
+		for (let i = 0; i < 10 && dir !== "" && dir !== path.dirname(dir); i++) {
+			const candidate = path.join(dir, "node_modules", "@earendil-works", "pi-ai", "dist", "providers", "data");
+			if (fs.existsSync(candidate)) return candidate;
+			dir = path.dirname(dir);
+		}
+		return null;
+	};
+	try {
+		const out = cp.execSync("which pi", { encoding: "utf8", timeout: 5000 }).trim();
+		if (out) {
+			const found = walkUp(path.dirname(fs.realpathSync(out)));
+			if (found) return (piCatalogDir = found);
+		}
+	} catch {
+		/* best-effort: catalog inheritance unavailable */
+	}
+	// Fallback: walk up from this extension's own file (e.g. a repo checkout).
+	piCatalogDir = walkUp(__dirname);
+	return piCatalogDir;
+}
+
+/**
+ * Merge all provider catalogs into root-model-id -> thinkingLevelMap.
+ * Only maps with at least one positive (string) value are kept, so noisy
+ * entries like Gemini's {"off": null} are ignored.
+ */
+function loadPiCatalogMaps(): Record<string, Record<string, string | null>> {
+	const fs = require("node:fs");
+	const path = require("node:path");
+	const maps: Record<string, Record<string, string | null>> = {};
+	const dir = findPiCatalogDir();
+	if (!dir) return maps;
+	try {
+		for (const file of fs.readdirSync(dir).sort()) {
+			if (!file.endsWith(".json")) continue;
+			const data = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+			if (!data) continue;
+			for (const section of Object.values(data)) {
+				if (!section || typeof section !== "object") continue;
+				for (const [mid, m] of Object.entries<any>(section)) {
+					const tlm: any = m?.thinkingLevelMap;
+					if (!tlm || typeof tlm !== "object") continue;
+					if (!Object.values(tlm).some((v) => typeof v === "string")) continue;
+					// Prefer more positive entries (less likely to hide a working
+					// effort), first file wins on ties.
+					const existing = maps[mid] ?? maps[mid.toLowerCase()];
+					if (
+						existing &&
+						Object.values(existing).filter((v) => typeof v === "string").length >=
+							Object.values(tlm).filter((v) => typeof v === "string").length
+					)
+						continue;
+					maps[mid] = tlm;
+					maps[mid.toLowerCase()] = tlm;
+				}
+			}
+		}
+	} catch {
+		/* best-effort */
+	}
+	return maps;
+}
+
+/**
+ * Inherit a thinkingLevelMap for a gateway model id ("alias/root") from pi's
+ * catalogs. The "off" key is always stripped: with the default openai
+ * thinkingFormat pi would otherwise send reasoning_effort:"off", which
+ * OpenAI-compatible endpoints reject (verified 400 on this gateway).
+ */
+function catalogThinkingLevelMap(id: string): Record<string, string | null> | undefined {
+	if (piCatalogMaps === undefined) piCatalogMaps = loadPiCatalogMaps();
+	// Candidate names: full id, alias-stripped root, and last segment, plus
+	// suffix-stripped variants ("-free", ":free", ":free-high"...) so gateway
+	// ids like trk/qwen/qwen3.8-max-free reach the catalog's qwen3.8-max.
+	const segs = id.split("/");
+	const names = [id, segs.slice(1).join("/"), segs[segs.length - 1]];
+	const candidates = new Set<string>();
+	for (const name of names) {
+		candidates.add(name);
+		let cur = name;
+		for (let i = 0; i < 3; i++) {
+			const next = cur.replace(/(:|-)(free|high|xhigh)$/, "");
+			if (next === cur || next.length === 0) break;
+			candidates.add(next);
+			cur = next;
+		}
+	}
+	for (const candidate of candidates) {
+		const map = piCatalogMaps[candidate] ?? piCatalogMaps[candidate.toLowerCase()];
+		if (!map) continue;
+		const { off: _off, ...rest } = map;
+		void _off;
+		if (Object.values(rest).some((v) => typeof v === "string")) return rest;
+	}
+	return undefined;
 }
 
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
@@ -178,10 +278,11 @@ function toModels(data: any[]): any[] {
 		// declared capabilities.effort_tiers so the thinking-level selector only
 		// offers levels the model accepts (pi never sends an invalid
 		// reasoning_effort, e.g. `high` on qwen3.8-max -> 400).
-		const thinkingMap =
-			THINKING_LEVEL_OVERRIDES[id] ??
-			(reasoning ? thinkingLevelMapFromTiers(m.capabilities?.effort_tiers) : undefined);
-		if (thinkingMap) entry.thinkingLevelMap = thinkingMap;
+		// Per the extension's design: gateway effort_tiers first, pi's built-in
+		// catalog second, and nothing (pi's default off/low/medium/high) otherwise.
+		const thinkingMap = reasoning ? thinkingLevelMapFromTiers(m.capabilities?.effort_tiers) : undefined;
+		const inherited = thinkingMap ?? (reasoning ? catalogThinkingLevelMap(id) : undefined);
+		if (inherited) entry.thinkingLevelMap = inherited;
 
 		// Apply known-correct values for models where OmniRoute reports bad data.
 		const override = MODEL_OVERRIDES[id];

@@ -10,13 +10,13 @@ OpenAI-compatible provider.
 - `/omniroute-sync` — pull `/v1/models` into the Ctrl+P model picker.
 - Status-bar indicator `OmniRoute ✓ / ✗` (with the active model id) shown on
   session start, refreshed every 60s, and updated on model switch.
-- **Reasoning effort per model** — sync reads the gateway's per-model
-  `capabilities.effort_tiers` and stamps a matching pi `thinkingLevelMap`, so
-  the thinking-level selector only offers levels the model accepts (pi never
-  sends an invalid `reasoning_effort`). Models whose gateway row omits tiers
-  can be pinned via `THINKING_LEVEL_OVERRIDES` in `extensions/omniroute.ts`; it
-  is pre-seeded for `charm-hyper/qwen3.8-max` and `trk/qwen/qwen3.8-max-free`,
-  which only accept `low` / `medium` / `xhigh` and 400 on `high`.
+- **Reasoning effort per model** — sync stamps a pi `thinkingLevelMap` so the
+  thinking-level selector only offers levels a model accepts (pi never sends an
+  invalid `reasoning_effort`, e.g. `high` on qwen3.8-max → 400). Source order:
+  1. the gateway's per-model `capabilities.effort_tiers` from `/v1/models`,
+  2. pi's built-in provider catalogs (`@earendil-works/pi-ai`, alias prefix
+     stripped — covers e.g. qwen3.8-max → `low/medium/xhigh`), 3. otherwise
+  nothing, and pi's default `off/low/medium/high` applies.
 - No third-party dependencies, no custom stream parser — uses pi-core's
   built-in OpenAI-compatible handler.
 

@@ -99,6 +99,46 @@ const MODEL_OVERRIDES: Record<string, { contextWindow?: number; maxTokens?: numb
 	"oc/deepseek-v4-flash-free": { contextWindow: 200000, maxTokens: 131072 },
 };
 
+/**
+ * Reasoning-effort tiers per model, keyed by model id. pi's default is to
+ * expose off/minimal/low/medium/high for every reasoning model and send the raw
+ * level as `reasoning_effort` — but some models accept only a subset and reject
+ * the rest (qwen3.8-max 400s on `high`; it only takes `low`/`medium`/`xhigh`).
+ * An entry maps pi's levels to what the model accepts: a string is the exact
+ * value sent, `null` hides the level from the selector and skips it when
+ * cycling. Values below mirror pi's own catalog entry for qwen3.8-max.
+ */
+const THINKING_LEVEL_OVERRIDES: Record<string, Record<string, string | null>> = {
+	// gateway doesn't publish effort_tiers for these, so pin them manually
+	"charm-hyper/qwen3.8-max": { minimal: null, high: null, max: null, low: "low", medium: "medium", xhigh: "xhigh" },
+	"trk/qwen/qwen3.8-max-free": { minimal: null, high: null, max: null, low: "low", medium: "medium", xhigh: "xhigh" },
+};
+
+/**
+ * Convert OmniRoute `capabilities.effort_tiers` ("none" | "low" | "medium" |
+ * "high" | "xhigh") into a pi `thinkingLevelMap`. Listed tiers map 1:1 to
+ * their own name ("none" means off is supported, so it keeps pi's default
+ * no-reasoning_effort behavior); unlisted pi levels become `null` so they are
+ * hidden and never sent. Returns undefined when no tiers are declared, leaving
+ * pi's default behavior in place.
+ */
+function thinkingLevelMapFromTiers(tiers: unknown): Record<string, string | null> | undefined {
+	if (!Array.isArray(tiers)) return undefined;
+	const tierNames = tiers.filter((t): t is string => typeof t === "string");
+	const piLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+	if (!tierNames.some((t) => t === "none" || piLevels.includes(t))) return undefined;
+	const tiersSet = new Set(tierNames);
+	const map: Record<string, string | null> = {};
+	for (const level of piLevels) {
+		if (level === "off") {
+			if (!tiersSet.has("none")) map.off = null;
+			continue;
+		}
+		map[level] = tiersSet.has(level) ? level : null;
+	}
+	return map;
+}
+
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
 function toModels(data: any[]): any[] {
 	const out: any[] = [];
@@ -131,7 +171,17 @@ function toModels(data: any[]): any[] {
 		entry.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 		if (m.capabilities?.tool_calling === false) entry.tool_calling = false;
-		if (m.capabilities?.reasoning || m.capabilities?.thinking) entry.reasoning = true;
+		const reasoning = !!(m.capabilities?.reasoning || m.capabilities?.thinking);
+		if (reasoning) entry.reasoning = true;
+
+		// Reasoning effort: a manual override wins, else derive from the gateway's
+		// declared capabilities.effort_tiers so the thinking-level selector only
+		// offers levels the model accepts (pi never sends an invalid
+		// reasoning_effort, e.g. `high` on qwen3.8-max -> 400).
+		const thinkingMap =
+			THINKING_LEVEL_OVERRIDES[id] ??
+			(reasoning ? thinkingLevelMapFromTiers(m.capabilities?.effort_tiers) : undefined);
+		if (thinkingMap) entry.thinkingLevelMap = thinkingMap;
 
 		// Apply known-correct values for models where OmniRoute reports bad data.
 		const override = MODEL_OVERRIDES[id];

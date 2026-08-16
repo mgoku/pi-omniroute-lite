@@ -101,6 +101,9 @@ the sandbox or the live `models.json` gets written.
   `id`, `input` (modalities, defaulting to `["text"]`), optional `name`/`contextWindow`/
   `maxTokens`, **always** `cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }`,
   `tool_calling: false` only when explicitly disabled, `reasoning: true` when advertised.
+  `thinkingLevelMap` is stamped from the gateway's `capabilities.effort_tiers` (a manual
+  `THINKING_LEVEL_OVERRIDES` entry wins) so the thinking-level selector only offers efforts
+  a model accepts — never send an invalid `reasoning_effort` like `high` on qwen3.8-max.
   Output is sorted by `id` for a clean Ctrl+P list.
 - **Status bar** — `OmniRoute ✓ / ✗` via `ctx.ui.setStatus`, refreshed on `session_start`,
   every 60s (`HEALTH_INTERVAL_MS`), and on `model_select` (appends the active model id).

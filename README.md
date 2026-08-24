@@ -10,6 +10,13 @@ OpenAI-compatible provider.
 - `/omniroute-sync` — pull `/v1/models` into the Ctrl+P model picker.
 - Status-bar indicator `OmniRoute ✓ / ✗` (with the active model id) shown on
   session start, refreshed every 60s, and updated on model switch.
+- **Upstream metadata enrichment** — OmniRoute reports generic/wrong metadata
+  for some providers (e.g. every `nous/*` model gets `context_length: 128000`,
+  no max output tokens, no effort tiers, no input modalities). During sync,
+  rows whose id starts with a known provider prefix are patched from that
+  provider's own `/v1/models` endpoint (currently: `nous` →
+  `https://inference-api.nousresearch.com/v1/models`). Best-effort: an
+  unreachable upstream leaves gateway data untouched.
 - **Reasoning effort per model** — sync stamps a pi `thinkingLevelMap` so the
   thinking-level selector only offers levels a model accepts (pi never sends an
   invalid `reasoning_effort`, e.g. `high` on qwen3.8-max → 400). Source order:

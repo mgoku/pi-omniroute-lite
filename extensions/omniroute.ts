@@ -239,6 +239,104 @@ function catalogThinkingLevelMap(id: string): Record<string, string | null> | un
 	return undefined;
 }
 
+// ---- upstream metadata enrichment -------------------------------------------
+// OmniRoute reports generic/wrong metadata for some providers — e.g. every
+// nous/* model gets context_length 128000, no max output tokens, no effort
+// tiers, no input modalities — while the provider's own /v1/models endpoint
+// has the real values. During sync, rows whose gateway id starts with a known
+// provider prefix are patched in place from that upstream endpoint. The ideal
+// fix lives in OmniRoute itself; this is a plugin-side workaround.
+
+const UPSTREAM_SOURCES: Record<string, string> = {
+	nous: "https://inference-api.nousresearch.com/v1/models",
+};
+
+/** Fetch an upstream provider's /v1/models and index rows by model id. */
+async function fetchUpstreamIndex(url: string): Promise<Map<string, any> | undefined> {
+	try {
+		const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+		if (!res.ok) return undefined;
+		const json = await res.json();
+		const rows = Array.isArray(json?.data) ? json.data : [];
+		const index = new Map<string, any>();
+		for (const m of rows) if (m?.id) index.set(m.id, m);
+		return index;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Resolve an upstream row for a root id, trying suffix-stripped variants. */
+function lookupUpstream(index: Map<string, any>, root: string): any | undefined {
+	let cur = root;
+	for (let i = 0; i < 4; i++) {
+		const hit = index.get(cur) ?? index.get(cur.toLowerCase());
+		if (hit) return hit;
+		const next = cur.replace(/(:|-)(free|high|xhigh)$/, "");
+		if (next === cur || next.length === 0) break;
+		cur = next;
+	}
+	return undefined;
+}
+
+/** Patch one gateway row in place with authoritative upstream metadata. */
+function applyUpstreamRow(row: any, up: any): void {
+	const ctxLen = up.context_length ?? up.top_provider?.context_length;
+	if (typeof ctxLen === "number") row.context_length = ctxLen;
+
+	const maxOut = up.top_provider?.max_completion_tokens ?? up.max_output_tokens;
+	if (typeof maxOut === "number") row.max_output_tokens = maxOut;
+
+	const modalities = up.architecture?.input_modalities;
+	if (Array.isArray(modalities) && modalities.length > 0) row.input_modalities = modalities;
+
+	if (typeof up.name === "string" && up.name) row.name = up.name;
+
+	row.capabilities = { ...(row.capabilities ?? {}) };
+	if (up.reasoning && typeof up.reasoning === "object") {
+		row.capabilities.reasoning = true;
+		// Reused by thinkingLevelMapFromTiers(): "none" marks off as supported,
+		// listed efforts map 1:1 to pi levels ("max"/"xhigh"/"minimal" included).
+		if (Array.isArray(up.reasoning.supported_efforts))
+			row.capabilities.effort_tiers = up.reasoning.supported_efforts;
+	}
+	const params = up.supported_parameters;
+	if (Array.isArray(params) && !params.includes("tools")) row.capabilities.tool_calling = false;
+}
+
+/**
+ * Enrich gateway rows from upstream provider catalogs. Best-effort: an
+ * unreachable upstream leaves rows untouched. Returns the enriched count.
+ */
+async function enrichFromUpstream(data: any[]): Promise<number> {
+	const byProvider = new Map<string, any[]>();
+	for (const m of data) {
+		const id = typeof m === "string" ? undefined : m?.id;
+		if (typeof id !== "string") continue;
+		const slash = id.indexOf("/");
+		if (slash <= 0) continue;
+		const prefix = id.slice(0, slash);
+		if (!UPSTREAM_SOURCES[prefix]) continue;
+		const list = byProvider.get(prefix) ?? [];
+		if (list.length === 0) byProvider.set(prefix, list);
+		list.push(m);
+	}
+
+	let enriched = 0;
+	for (const [prefix, rows] of byProvider) {
+		const index = await fetchUpstreamIndex(UPSTREAM_SOURCES[prefix]);
+		if (!index) continue; /* best-effort: keep gateway data */
+		for (const row of rows) {
+			const root = String(row.id).slice(prefix.length + 1);
+			const up = lookupUpstream(index, root);
+			if (!up) continue;
+			applyUpstreamRow(row, up);
+			enriched++;
+		}
+	}
+	return enriched;
+}
+
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
 function toModels(data: any[]): any[] {
 	const out: any[] = [];
@@ -453,6 +551,7 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 				return;
 			}
 
+			const enriched = await enrichFromUpstream(data);
 			const models = toModels(data);
 			config.providers ??= {};
 			config.providers[PROVIDER_ID] = {
@@ -476,7 +575,8 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 			}
 
 			ctx.ui.notify(
-				`✅ Synced ${models.length} models to Ctrl+P (api: ${API}).`,
+				`✅ Synced ${models.length} models to Ctrl+P (api: ${API})` +
+					(enriched > 0 ? `, ${enriched} enriched from upstream metadata.` : "."),
 				"info",
 			);
 		},

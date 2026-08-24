@@ -493,6 +493,25 @@ async function enrichFromUpstream(data: any[]): Promise<{ enriched: number; warn
 	return { enriched, warning };
 }
 
+/**
+ * pi only supports text and image input modalities — no api implementation
+ * handles video, so a model advertising it (e.g. OpenRouter catalogs list
+ * "video" in architecture.input_modalities for video-capable models, and
+ * upstream enrichment copies that verbatim) would claim a modality pi can
+ * never actually send. Filter to what pi supports; a model whose declared
+ * modalities contain neither text nor image falls back to pi's default
+ * ["text"] so the entry stays usable.
+ */
+const PI_INPUT_MODALITIES = new Set(["text", "image"]);
+
+function sanitizeInputModalities(mods: unknown): string[] | undefined {
+	if (!Array.isArray(mods)) return undefined;
+	const filtered = mods.filter(
+		(m): m is string => typeof m === "string" && PI_INPUT_MODALITIES.has(m),
+	);
+	return filtered.length > 0 ? filtered : undefined;
+}
+
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
 function toModels(data: any[]): any[] {
 	const out: any[] = [];
@@ -502,11 +521,10 @@ function toModels(data: any[]): any[] {
 
 		const entry: any = {
 			id,
-			input: Array.isArray(m.input_modalities)
-				? m.input_modalities
-				: Array.isArray(m.input)
-					? m.input
-					: ["text"],
+			input:
+				sanitizeInputModalities(m.input_modalities) ??
+				sanitizeInputModalities(m.input) ??
+				["text"],
 		};
 
 		// Preserve a friendly name when available.

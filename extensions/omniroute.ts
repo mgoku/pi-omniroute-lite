@@ -246,15 +246,174 @@ function catalogThinkingLevelMap(id: string): Record<string, string | null> | un
 // has the real values. During sync, rows whose gateway id starts with a known
 // provider prefix are patched in place from that upstream endpoint. The ideal
 // fix lives in OmniRoute itself; this is a plugin-side workaround.
+//
+// Pluggable by design: the provider list is configurable at
+// ~/.pi/agent/omniroute-upstreams.json (next to models.json; honors PI_HOME),
+// merged over built-in defaults. Each entry names a gateway id prefix, the
+// provider's /v1/models URL, and a named row extractor. Row shapes differ per
+// provider (OpenRouter-style vs plain OpenAI-style), so extraction is named;
+// see EXTRACTORS.
 
-const UPSTREAM_SOURCES: Record<string, string> = {
-	nous: "https://inference-api.nousresearch.com/v1/models",
+/** Normalized authoritative metadata for one gateway model row. */
+interface UpstreamMeta {
+	contextWindow?: number;
+	maxOutputTokens?: number;
+	inputModalities?: string[];
+	name?: string;
+	reasoning?: boolean;
+	/** Supported reasoning efforts, e.g. ["none", "low", "high"]. */
+	effortTiers?: string[];
+	/** false => model rejects tool calls; undefined => unknown, leave as-is. */
+	toolsSupported?: boolean;
+}
+
+/**
+ * Extractor for OpenRouter-shaped rows (top_provider, architecture, reasoning,
+ * supported_parameters) — used by nous and any provider that mirrors that
+ * schema.
+ */
+function extractOpenRouter(up: any): UpstreamMeta {
+	const meta: UpstreamMeta = {};
+
+	const ctxLen = up.context_length ?? up.top_provider?.context_length;
+	if (typeof ctxLen === "number") meta.contextWindow = ctxLen;
+
+	const maxOut = up.top_provider?.max_completion_tokens ?? up.max_output_tokens;
+	if (typeof maxOut === "number") meta.maxOutputTokens = maxOut;
+
+	const modalities = up.architecture?.input_modalities;
+	if (Array.isArray(modalities) && modalities.length > 0) meta.inputModalities = modalities;
+
+	if (typeof up.name === "string" && up.name) meta.name = up.name;
+
+	if (up.reasoning && typeof up.reasoning === "object") {
+		meta.reasoning = true;
+		// Reused by thinkingLevelMapFromTiers(): "none" marks off as supported,
+		// listed efforts map 1:1 to pi levels ("max"/"xhigh"/"minimal" included).
+		if (Array.isArray(up.reasoning.supported_efforts))
+			meta.effortTiers = up.reasoning.supported_efforts;
+	}
+
+	const params = up.supported_parameters;
+	if (Array.isArray(params)) meta.toolsSupported = params.includes("tools");
+
+	return meta;
+}
+
+/**
+ * Extractor for plain/generic rows: flat fields under common aliases.
+ * Forgiving — anything missing simply keeps the gateway's value.
+ */
+function extractOpenAi(up: any): UpstreamMeta {
+	const meta: UpstreamMeta = {};
+	const num = (v: unknown) => (typeof v === "number" && v > 0 ? v : undefined);
+
+	meta.contextWindow =
+		num(up.context_length) ?? num(up.context_window) ?? num(up.max_input_tokens);
+	meta.maxOutputTokens =
+		num(up.max_output_tokens) ?? num(up.max_completion_tokens) ?? num(up.max_tokens);
+
+	const modalities = up.input_modalities ?? up.modalities;
+	if (Array.isArray(modalities) && modalities.length > 0) meta.inputModalities = modalities;
+
+	if (typeof up.name === "string" && up.name) meta.name = up.name;
+	if (up.reasoning === true || up.supports_reasoning_effort === true) meta.reasoning = true;
+
+	return meta;
+}
+
+/** Named extractors referenceable from omniroute-upstreams.json. */
+const EXTRACTORS: Record<string, (up: any) => UpstreamMeta> = {
+	openrouter: extractOpenRouter,
+	openai: extractOpenAi,
 };
 
-/** Fetch an upstream provider's /v1/models and index rows by model id. */
-async function fetchUpstreamIndex(url: string): Promise<Map<string, any> | undefined> {
+/**
+ * One resolved upstream provider: `prefix` matches gateway model ids of the
+ * form "<prefix>/<root>"; `extract` normalizes one upstream row; `apiKey`
+ * (optional) is sent as a Bearer token for providers that gate /v1/models.
+ */
+interface UpstreamSource {
+	prefix: string;
+	url: string;
+	extract: (up: any) => UpstreamMeta;
+	apiKey?: string;
+}
+
+/** JSON config entry in omniroute-upstreams.json (`providers` array). */
+interface UpstreamConfigEntry {
+	prefix: string;
+	url: string;
+	/** Extractor name from EXTRACTORS. Defaults to "openrouter". */
+	extract?: string;
+	/** Bearer token for providers that require auth on /v1/models. */
+	apiKey?: string;
+	/** true removes this prefix (also disables built-ins). */
+	disabled?: boolean;
+}
+
+/** Built-in defaults; the JSON config can add, override, or disable entries. */
+const BUILTIN_UPSTREAMS: UpstreamConfigEntry[] = [
+	{ prefix: "nous", url: "https://inference-api.nousresearch.com/v1/models", extract: "openrouter" },
+];
+
+/** Config lives next to models.json, so it follows the same PI_HOME/layout rules. */
+function upstreamConfigPath(): string {
+	const path = require("node:path");
+	return path.join(path.dirname(modelsJsonPath()), "omniroute-upstreams.json");
+}
+
+/**
+ * Merge built-ins with omniroute-upstreams.json (read fresh each sync, so
+ * edits apply on the next /omniroute-sync without a restart). Missing file is
+ * the normal zero-config path; a malformed file falls back to built-ins and
+ * reports a warning string.
+ */
+function loadUpstreamSources(): { sources: UpstreamSource[]; warning?: string } {
+	const fs = require("node:fs");
+	const configs = new Map<string, UpstreamConfigEntry>();
+	for (const entry of BUILTIN_UPSTREAMS) configs.set(entry.prefix, entry);
+
+	const warnings: string[] = [];
 	try {
-		const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+		const raw = JSON.parse(fs.readFileSync(upstreamConfigPath(), "utf8"));
+		const list = Array.isArray(raw?.providers) ? raw.providers : [];
+		for (const e of list) {
+			if (!e || typeof e.prefix !== "string" || !e.prefix) continue;
+			if (e.disabled === true) {
+				configs.delete(e.prefix);
+				continue;
+			}
+			if (typeof e.url !== "string" || !/^https?:\/\//.test(e.url)) continue;
+			configs.set(e.prefix, { ...configs.get(e.prefix), ...e });
+		}
+	} catch (err: any) {
+		if (err?.code !== "ENOENT")
+			warnings.push(`omniroute-upstreams.json ignored: ${err?.message ?? err}`);
+	}
+
+	const sources: UpstreamSource[] = [];
+	for (const cfg of configs.values()) {
+		const name = cfg.extract ?? "openrouter";
+		const extract = EXTRACTORS[name];
+		if (!extract) warnings.push(`unknown extractor "${name}" for "${cfg.prefix}", using openrouter`);
+		sources.push({
+			prefix: cfg.prefix,
+			url: cfg.url,
+			extract: extract ?? extractOpenRouter,
+			apiKey: typeof cfg.apiKey === "string" && cfg.apiKey ? cfg.apiKey : undefined,
+		});
+	}
+	return { sources, warning: warnings.length > 0 ? warnings.join("; ") : undefined };
+}
+
+/** Fetch an upstream provider's /v1/models and index rows by model id. */
+async function fetchUpstreamIndex(url: string, apiKey?: string): Promise<Map<string, any> | undefined> {
+	try {
+		const res = await fetch(url, {
+			headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+			signal: AbortSignal.timeout(10000),
+		});
 		if (!res.ok) return undefined;
 		const json = await res.json();
 		const rows = Array.isArray(json?.data) ? json.data : [];
@@ -279,36 +438,31 @@ function lookupUpstream(index: Map<string, any>, root: string): any | undefined 
 	return undefined;
 }
 
-/** Patch one gateway row in place with authoritative upstream metadata. */
-function applyUpstreamRow(row: any, up: any): void {
-	const ctxLen = up.context_length ?? up.top_provider?.context_length;
-	if (typeof ctxLen === "number") row.context_length = ctxLen;
-
-	const maxOut = up.top_provider?.max_completion_tokens ?? up.max_output_tokens;
-	if (typeof maxOut === "number") row.max_output_tokens = maxOut;
-
-	const modalities = up.architecture?.input_modalities;
-	if (Array.isArray(modalities) && modalities.length > 0) row.input_modalities = modalities;
-
-	if (typeof up.name === "string" && up.name) row.name = up.name;
+/** Patch one gateway row in place with normalized upstream metadata. */
+function applyUpstreamMeta(row: any, meta: UpstreamMeta): void {
+	if (typeof meta.contextWindow === "number") row.context_length = meta.contextWindow;
+	if (typeof meta.maxOutputTokens === "number") row.max_output_tokens = meta.maxOutputTokens;
+	if (Array.isArray(meta.inputModalities) && meta.inputModalities.length > 0)
+		row.input_modalities = meta.inputModalities;
+	if (typeof meta.name === "string" && meta.name) row.name = meta.name;
 
 	row.capabilities = { ...(row.capabilities ?? {}) };
-	if (up.reasoning && typeof up.reasoning === "object") {
+	if (meta.reasoning) {
 		row.capabilities.reasoning = true;
-		// Reused by thinkingLevelMapFromTiers(): "none" marks off as supported,
-		// listed efforts map 1:1 to pi levels ("max"/"xhigh"/"minimal" included).
-		if (Array.isArray(up.reasoning.supported_efforts))
-			row.capabilities.effort_tiers = up.reasoning.supported_efforts;
+		if (meta.effortTiers) row.capabilities.effort_tiers = meta.effortTiers;
 	}
-	const params = up.supported_parameters;
-	if (Array.isArray(params) && !params.includes("tools")) row.capabilities.tool_calling = false;
+	if (meta.toolsSupported === false) row.capabilities.tool_calling = false;
 }
 
 /**
  * Enrich gateway rows from upstream provider catalogs. Best-effort: an
- * unreachable upstream leaves rows untouched. Returns the enriched count.
+ * unreachable upstream leaves rows untouched. Returns the enriched count and
+ * any config warning (malformed omniroute-upstreams.json, unknown extractor).
  */
-async function enrichFromUpstream(data: any[]): Promise<number> {
+async function enrichFromUpstream(data: any[]): Promise<{ enriched: number; warning?: string }> {
+	const { sources, warning } = loadUpstreamSources();
+	const byPrefix = new Map(sources.map((s) => [s.prefix, s]));
+
 	const byProvider = new Map<string, any[]>();
 	for (const m of data) {
 		const id = typeof m === "string" ? undefined : m?.id;
@@ -316,7 +470,7 @@ async function enrichFromUpstream(data: any[]): Promise<number> {
 		const slash = id.indexOf("/");
 		if (slash <= 0) continue;
 		const prefix = id.slice(0, slash);
-		if (!UPSTREAM_SOURCES[prefix]) continue;
+		if (!byPrefix.has(prefix)) continue;
 		const list = byProvider.get(prefix) ?? [];
 		if (list.length === 0) byProvider.set(prefix, list);
 		list.push(m);
@@ -324,17 +478,19 @@ async function enrichFromUpstream(data: any[]): Promise<number> {
 
 	let enriched = 0;
 	for (const [prefix, rows] of byProvider) {
-		const index = await fetchUpstreamIndex(UPSTREAM_SOURCES[prefix]);
+		const source = byPrefix.get(prefix);
+		if (!source) continue;
+		const index = await fetchUpstreamIndex(source.url, source.apiKey);
 		if (!index) continue; /* best-effort: keep gateway data */
 		for (const row of rows) {
 			const root = String(row.id).slice(prefix.length + 1);
 			const up = lookupUpstream(index, root);
 			if (!up) continue;
-			applyUpstreamRow(row, up);
+			applyUpstreamMeta(row, source.extract(up));
 			enriched++;
 		}
 	}
-	return enriched;
+	return { enriched, warning };
 }
 
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
@@ -551,7 +707,8 @@ export default function omnirouteExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const enriched = await enrichFromUpstream(data);
+			const { enriched, warning: upstreamWarning } = await enrichFromUpstream(data);
+			if (upstreamWarning) ctx.ui.notify(`⚠️ ${upstreamWarning}`, "warning");
 			const models = toModels(data);
 			config.providers ??= {};
 			config.providers[PROVIDER_ID] = {

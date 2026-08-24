@@ -118,6 +118,16 @@ the sandbox or the live `models.json` gets written.
   this behavior — don't "normalize" the URL construction without testing against a real gateway.
 - **Sync** — same fetch, 10s timeout, then `ctx.modelRegistry.refresh()` (best-effort, wrapped;
   pi reload picks it up if it fails).
+- **Upstream enrichment** — during sync, rows whose gateway id starts with a known
+  provider prefix are patched from that provider's own `/v1/models` endpoint
+  (fixes wrong context/max-token/eff metadata OmniRoute reports, e.g. all
+  `nous/*` rows). The provider list is built-in (`nous`) merged with
+  `~/.pi/agent/omniroute-upstreams.json` (next to `models.json`, honors `PI_HOME`,
+  re-read fresh on every sync). Entries: `prefix`, `url`, `extract`
+  (`openrouter` | `openai`, default `openrouter`), optional `apiKey`
+  (Bearer token for gated `/v1/models`), `disabled: true` to remove a prefix.
+  Malformed file ⇒ fall back to built-ins + warning notify. Best-effort:
+  unreachable upstream leaves rows untouched.
 - **Commands** — `/omniroute-setup` (prompt base URL + key, write provider) and
   `/omniroute-sync` (pull models into the Ctrl+P picker).
 

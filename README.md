@@ -14,9 +14,10 @@ OpenAI-compatible provider.
   for some providers (e.g. every `nous/*` model gets `context_length: 128000`,
   no max output tokens, no effort tiers, no input modalities). During sync,
   rows whose id starts with a known provider prefix are patched from that
-  provider's own `/v1/models` endpoint (currently: `nous` →
-  `https://inference-api.nousresearch.com/v1/models`). Best-effort: an
-  unreachable upstream leaves gateway data untouched.
+  provider's own `/v1/models` endpoint. Built-in: `nous` →
+  `https://inference-api.nousresearch.com/v1/models`. Best-effort: an
+  unreachable upstream leaves gateway data untouched. The provider list is
+  configurable — see [Upstream providers](#upstream-providers).
 - **Reasoning effort per model** — sync stamps a pi `thinkingLevelMap` so the
   thinking-level selector only offers levels a model accepts (pi never sends an
   invalid `reasoning_effort`, e.g. `high` on qwen3.8-max → 400). Source order:
@@ -52,6 +53,38 @@ Restart pi (or `/reload`), then:
 2. `/omniroute-sync` — pulls the model list.
 3. Verify `/model` shows your OmniRoute models and that
    `fetch_content({ mode: "answer", ... })` works.
+
+## Upstream providers
+
+When OmniRoute reports wrong metadata for a provider, sync can patch those
+models from the provider's own `/v1/models` endpoint. The built-in list ships
+with `nous`; add or override providers in
+`~/.pi/agent/omniroute-upstreams.json` (next to `models.json`, honors
+`PI_HOME`). The file is re-read on every `/omniroute-sync` — no restart
+needed.
+
+```json
+{
+  "providers": [
+    {
+      "prefix": "acme",
+      "url": "https://api.acme.ai/v1/models",
+      "extract": "openrouter",
+      "apiKey": "sk-..."
+    },
+    { "prefix": "nous", "disabled": true }
+  ]
+}
+```
+
+- `prefix` — gateway model-id prefix (`acme` matches `acme/<model>`).
+- `url` — the provider's `/v1/models` endpoint.
+- `extract` — row shape: `openrouter` (top_provider / architecture / reasoning
+  fields, the default) or `openai` (flat context_length / max_output_tokens).
+- `apiKey` — optional Bearer token for providers that gate `/v1/models`.
+- `disabled: true` — removes a prefix, including built-ins.
+
+A malformed file falls back to the built-ins and shows a warning after sync.
 
 ## Develop
 

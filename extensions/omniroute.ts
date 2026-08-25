@@ -91,13 +91,56 @@ async function checkHealth(baseUrl: string, apiKey: string): Promise<boolean> {
 }
 
 /**
- * OmniRoute's /v1/models returns wrong context/max-token values for some models.
+ * OmniRoute reports wrong/zero context or max-output values for some models.
  * These overrides stamp the correct values during sync. Keyed by model id.
  * contextWindow = total context; maxTokens = max output tokens.
+ *
+ * Kept as built-in defaults that match the gateway's real data, so the common
+ * offenders work out of the box. User entries in omniroute-upstreams.json
+ * (the "overrides" map, see loadModelOverrides) are merged over these and
+ * win on ties — so fixing a model no longer requires editing + rebuilding the
+ * extension. Anything here can be superseded or disabled from config.
  */
 const MODEL_OVERRIDES: Record<string, { contextWindow?: number; maxTokens?: number }> = {
 	"oc/deepseek-v4-flash-free": { contextWindow: 200000, maxTokens: 131072 },
 };
+
+/** A contextWindow / maxTokens value is usable only if a positive finite number. */
+function plausibleWindow(v: unknown): number | undefined {
+	return typeof v === "number" && isFinite(v) && v > 0 ? v : undefined;
+}
+
+/**
+ * Merged model-override map: built-in MODEL_OVERRIDES (case 3 defaults that
+ * match the gateway's real data, so common offenders work out of the box)
+ * merged under the user's omniroute-upstreams.json "overrides" entries, which
+ * win on ties. Returns a fresh map each call so it can be parsed once per sync
+ * (the config file is re-read live). Fixing a model no longer requires editing
+ * + rebuilding the extension.
+ */
+function loadModelOverrides(): Record<string, { contextWindow?: number; maxTokens?: number }> {
+	const merged: Record<string, { contextWindow?: number; maxTokens?: number }> = { ...MODEL_OVERRIDES };
+	const userOverrides = loadUpstreamSources().overrides;
+	for (const [mid, o] of Object.entries(userOverrides)) {
+		const cw = plausibleWindow(o?.contextWindow);
+		const mt = plausibleWindow(o?.maxTokens);
+		if (cw !== undefined || mt !== undefined) {
+			merged[mid] = { ...(MODEL_OVERRIDES[mid] ?? {}), ...(cw !== undefined ? { contextWindow: cw } : {}), ...(mt !== undefined ? { maxTokens: mt } : {}) };
+		}
+	}
+	return merged;
+}
+
+/**
+ * Returns { contextWindow, maxTokens } for an id from the merged override map,
+ * or undefined when the id has no override entry at all.
+ */
+function resolveModelOverride(
+	overrides: Record<string, { contextWindow?: number; maxTokens?: number }>,
+	id: string,
+): { contextWindow?: number; maxTokens?: number } | undefined {
+	return overrides[id];
+}
 
 /**
  * Convert OmniRoute `capabilities.effort_tiers` ("none" | "low" | "medium" |
@@ -132,7 +175,21 @@ function thinkingLevelMapFromTiers(tiers: unknown): Record<string, string | null
 // guessing with the default off/low/medium/high list.
 
 let piCatalogDir: string | null | undefined; // undefined = not probed yet
-let piCatalogMaps: Record<string, Record<string, string | null>> | undefined;
+/**
+ * One pi-ai catalog model entry we backfill from. pi-ai's own catalogs
+ * (@earendil-works/pi-ai/dist/providers/data/*.json) carry the same
+ * contextWindow / maxTokens / input / thinkingLevelMap pi trusts for its own
+ * providers — we reuse that source so a model with no usable upstream metadata
+ * still gets sane values (case 1: upstream provides nothing / invalid data).
+ */
+interface PiCatalogModel {
+	contextWindow?: number;
+	maxTokens?: number;
+	input?: string[];
+	thinkingLevelMap?: Record<string, string | null>;
+}
+
+let piCatalogMaps: Record<string, PiCatalogModel> | undefined;
 
 /** Locate pi-ai's provider catalogs by walking up from the `pi` binary. */
 function findPiCatalogDir(): string | null {
@@ -164,16 +221,18 @@ function findPiCatalogDir(): string | null {
 }
 
 /**
- * Merge all provider catalogs into root-model-id -> thinkingLevelMap.
- * Only maps with at least one positive (string) value are kept, so noisy
- * entries like Gemini's {"off": null} are ignored.
+ * Merge all provider catalogs into root-model-id -> PiCatalogModel. We keep
+ * every entry that has at least one usable field (contextWindow / maxTokens /
+ * input / thinkingLevelMap) so it can fill gaps the gateway left open. First
+ * file wins on ties by field-count, so later catalogs augment rather than
+ * clobber a fuller entry for the same id.
  */
-function loadPiCatalogMaps(): Record<string, Record<string, string | null>> {
+function loadPiCatalogMaps(): Record<string, PiCatalogModel> {
 	const fs = require("node:fs");
 	const path = require("node:path");
-	const maps: Record<string, Record<string, string | null>> = {};
+	const models: Record<string, PiCatalogModel> = {};
 	const dir = findPiCatalogDir();
-	if (!dir) return maps;
+	if (!dir) return models;
 	try {
 		for (const file of fs.readdirSync(dir).sort()) {
 			if (!file.endsWith(".json")) continue;
@@ -182,40 +241,42 @@ function loadPiCatalogMaps(): Record<string, Record<string, string | null>> {
 			for (const section of Object.values(data)) {
 				if (!section || typeof section !== "object") continue;
 				for (const [mid, m] of Object.entries<any>(section)) {
-					const tlm: any = m?.thinkingLevelMap;
-					if (!tlm || typeof tlm !== "object") continue;
-					if (!Object.values(tlm).some((v) => typeof v === "string")) continue;
-					// Prefer more positive entries (less likely to hide a working
-					// effort), first file wins on ties.
-					const existing = maps[mid] ?? maps[mid.toLowerCase()];
-					if (
-						existing &&
-						Object.values(existing).filter((v) => typeof v === "string").length >=
-							Object.values(tlm).filter((v) => typeof v === "string").length
-					)
-						continue;
-					maps[mid] = tlm;
-					maps[mid.toLowerCase()] = tlm;
+					if (!m || typeof m !== "object") continue;
+					const entry: PiCatalogModel = {};
+					const cw = typeof m.contextWindow === "number" && m.contextWindow > 0 ? m.contextWindow : undefined;
+					const mt = typeof m.maxTokens === "number" && m.maxTokens > 0 ? m.maxTokens : undefined;
+					if (cw) entry.contextWindow = cw;
+					if (mt) entry.maxTokens = mt;
+					if (Array.isArray(m.input) && m.input.length > 0) entry.input = m.input;
+					const tlm: any = m.thinkingLevelMap;
+					if (tlm && typeof tlm === "object" && Object.values(tlm).some((v) => typeof v === "string"))
+						entry.thinkingLevelMap = tlm;
+					// Nothing useful for this id in this catalog — skip so it doesn't
+					// clobber a better entry for the same id.
+					if (Object.keys(entry).length === 0) continue;
+					const existing = models[mid] ?? models[mid.toLowerCase()];
+					if (existing && Object.keys(existing).length >= Object.keys(entry).length) continue;
+					models[mid] = entry;
+					models[mid.toLowerCase()] = entry;
 				}
 			}
 		}
 	} catch {
 		/* best-effort */
 	}
-	return maps;
+	return models;
 }
 
 /**
- * Inherit a thinkingLevelMap for a gateway model id ("alias/root") from pi's
- * catalogs. The "off" key is always stripped: with the default openai
- * thinkingFormat pi would otherwise send reasoning_effort:"off", which
- * OpenAI-compatible endpoints reject (verified 400 on this gateway).
+ * Inherit pi-ai catalog metadata for a gateway model id ("alias/root"). Returns
+ * the merged entry (contextWindow / maxTokens / input / thinkingLevelMap) or
+ * undefined when nothing matches. The candidate-name logic mirrors the id
+ * variants pi's gateway actually uses: full id, alias-stripped root, last
+ * segment, and suffix-stripped ("-free" / ":free" / ":free-high") so ids like
+ * trk/qwen/qwen3.8-max-free reach the catalog's qwen3.8-max.
  */
-function catalogThinkingLevelMap(id: string): Record<string, string | null> | undefined {
+function catalogModelMeta(id: string): PiCatalogModel | undefined {
 	if (piCatalogMaps === undefined) piCatalogMaps = loadPiCatalogMaps();
-	// Candidate names: full id, alias-stripped root, and last segment, plus
-	// suffix-stripped variants ("-free", ":free", ":free-high"...) so gateway
-	// ids like trk/qwen/qwen3.8-max-free reach the catalog's qwen3.8-max.
 	const segs = id.split("/");
 	const names = [id, segs.slice(1).join("/"), segs[segs.length - 1]];
 	const candidates = new Set<string>();
@@ -230,16 +291,30 @@ function catalogThinkingLevelMap(id: string): Record<string, string | null> | un
 		}
 	}
 	for (const candidate of candidates) {
-		const map = piCatalogMaps[candidate] ?? piCatalogMaps[candidate.toLowerCase()];
-		if (!map) continue;
-		const { off: _off, ...rest } = map;
-		void _off;
-		if (Object.values(rest).some((v) => typeof v === "string")) return rest;
+		const entry = piCatalogMaps[candidate] ?? piCatalogMaps[candidate.toLowerCase()];
+		if (entry && Object.keys(entry).length > 0) return entry;
 	}
 	return undefined;
 }
 
-// ---- upstream metadata enrichment -------------------------------------------
+/**
+ * Inherit a thinkingLevelMap for a gateway model id from pi's catalogs (case
+ * 1 backstop for the reasoning-effort selector). The "off" key is always
+ * stripped: with the default openai thinkingFormat pi would otherwise send
+ * reasoning_effort:"off", which OpenAI-compatible endpoints reject (verified
+ * 400 on this gateway).
+ */
+function catalogThinkingLevelMap(id: string): Record<string, string | null> | undefined {
+	const meta = catalogModelMeta(id);
+	const map = meta?.thinkingLevelMap;
+	if (!map) return undefined;
+	const { off: _off, ...rest } = map;
+	void _off;
+	if (Object.values(rest).some((v) => typeof v === "string")) return rest;
+	return undefined;
+}
+
+// ---- upstream metadata enrichment
 // OmniRoute reports generic/wrong metadata for some providers — e.g. every
 // nous/* model gets context_length 128000, no max output tokens, no effort
 // tiers, no input modalities — while the provider's own /v1/models endpoint
@@ -369,12 +444,17 @@ function upstreamConfigPath(): string {
  * the normal zero-config path; a malformed file falls back to built-ins and
  * reports a warning string.
  */
-function loadUpstreamSources(): { sources: UpstreamSource[]; warning?: string } {
+function loadUpstreamSources(): {
+	sources: UpstreamSource[];
+	overrides: Record<string, { contextWindow?: number; maxTokens?: number }>;
+	warning?: string;
+} {
 	const fs = require("node:fs");
 	const configs = new Map<string, UpstreamConfigEntry>();
 	for (const entry of BUILTIN_UPSTREAMS) configs.set(entry.prefix, entry);
 
 	const warnings: string[] = [];
+	let overrides: Record<string, { contextWindow?: number; maxTokens?: number }> = {};
 	try {
 		const raw = JSON.parse(fs.readFileSync(upstreamConfigPath(), "utf8"));
 		const list = Array.isArray(raw?.providers) ? raw.providers : [];
@@ -386,6 +466,17 @@ function loadUpstreamSources(): { sources: UpstreamSource[]; warning?: string } 
 			}
 			if (typeof e.url !== "string" || !/^https?:\/\//.test(e.url)) continue;
 			configs.set(e.prefix, { ...configs.get(e.prefix), ...e });
+		}
+		// Manual model overrides (case 3): keyed by model id, merged over the
+		// built-in MODEL_OVERRIDES at sync time via resolveModelOverride().
+		if (raw?.overrides && typeof raw.overrides === "object") {
+			for (const [mid, o] of Object.entries<any>(raw.overrides)) {
+				if (!mid) continue;
+				const cw = typeof o?.contextWindow === "number" ? o.contextWindow : undefined;
+				const mt = typeof o?.maxTokens === "number" ? o.maxTokens : undefined;
+				if (cw === undefined && mt === undefined) continue;
+				overrides[mid] = { ...(cw !== undefined ? { contextWindow: cw } : {}), ...(mt !== undefined ? { maxTokens: mt } : {}) };
+			}
 		}
 	} catch (err: any) {
 		if (err?.code !== "ENOENT")
@@ -404,7 +495,7 @@ function loadUpstreamSources(): { sources: UpstreamSource[]; warning?: string } 
 			apiKey: typeof cfg.apiKey === "string" && cfg.apiKey ? cfg.apiKey : undefined,
 		});
 	}
-	return { sources, warning: warnings.length > 0 ? warnings.join("; ") : undefined };
+	return { sources, overrides, warning: warnings.length > 0 ? warnings.join("; ") : undefined };
 }
 
 /** Fetch an upstream provider's /v1/models and index rows by model id. */
@@ -514,11 +605,18 @@ function sanitizeInputModalities(mods: unknown): string[] | undefined {
 
 /** Convert OmniRoute /v1/models rows into pi models.json model entries. */
 function toModels(data: any[]): any[] {
+	// Parse the override map once for the whole sync (built-ins merged under the
+	// user's omniroute-upstreams.json "overrides" entries, which win).
 	const out: any[] = [];
+	const overrides = loadModelOverrides();
 	for (const m of data) {
 		const id = typeof m === "string" ? m : m.id;
 		if (!id) continue;
 
+		// Seed input modalities; pi only supports text/image. The gateway value is
+		// trusted when it yields something usable (sanitizeInputModalities already
+		// drops unsupported modalities and falls back to undefined for empty),
+		// and the pi-ai catalog backfill below is the gap-filler for case 1.
 		const entry: any = {
 			id,
 			input:
@@ -532,11 +630,34 @@ function toModels(data: any[]): any[] {
 			typeof m === "object" ? (m.name ?? m.root ?? m.id) : id;
 		if (name && name !== id) entry.name = name;
 
-		const ctx = m.context_length ?? m.max_input_tokens;
-		if (ctx) entry.contextWindow = ctx;
+		// --- contextWindow / maxTokens resolution ---------------------------
+		// Precedence (highest first):
+		//   3. pi-ai catalog (case 1 backstop — fills missing/invalid data)
+		//   2. gateway /v1/models (trusted only when plausible — case 3 guard)
+		//   1. pi default (omitted entirely; pi falls back to its own default)
+		// A manual override (case 3, lowest effort to set) is applied on top of
+		// all of the above at the end of this block via resolveModelOverride().
+		const gwCtx = plausibleWindow(m.context_length ?? m.max_input_tokens);
+		const gwMax = plausibleWindow(m.max_output_tokens ?? m.max_tokens);
 
-		const maxOut = m.max_output_tokens ?? m.max_tokens;
-		if (maxOut) entry.maxTokens = maxOut;
+		// Case 1 backstop: inherit from pi-ai's own catalogs (same source pi
+		// trusts). Only fills gaps — never overrides a plausible gateway value.
+		const catalog = catalogModelMeta(id);
+		if (gwCtx === undefined && catalog?.contextWindow !== undefined)
+			entry.contextWindow = catalog.contextWindow;
+		if (gwMax === undefined && catalog?.maxTokens !== undefined)
+			entry.maxTokens = catalog.maxTokens;
+		// A plausible gateway value beats an absent catalog value; only when the
+		// gateway gave nothing usable does the catalog value (set above) survive.
+		if (gwCtx !== undefined) entry.contextWindow = gwCtx;
+		if (gwMax !== undefined) entry.maxTokens = gwMax;
+
+		// Input modalities: trust the gateway if it declared anything usable;
+		// otherwise backfill from the pi-ai catalog (it lists text/image too).
+		if (entry.input.length === 1 && entry.input[0] === "text" && Array.isArray(catalog?.input)) {
+			const cmod = sanitizeInputModalities(catalog.input);
+			if (cmod) entry.input = cmod;
+		}
 
 		// pi's model override path reads model.cost.tiers; a missing cost object
 		// throws "Cannot read properties of undefined (reading 'tiers')".
@@ -556,8 +677,12 @@ function toModels(data: any[]): any[] {
 		const inherited = thinkingMap ?? (reasoning ? catalogThinkingLevelMap(id) : undefined);
 		if (inherited) entry.thinkingLevelMap = inherited;
 
-		// Apply known-correct values for models where OmniRoute reports bad data.
-		const override = MODEL_OVERRIDES[id];
+		// Case 3: manual overrides (built-in MODEL_OVERRIDES merged over the
+		// user's omniroute-upstreams.json "overrides" map). Applied last and
+		// unconditionally because the operator explicitly named this id — it wins
+		// over both gateway and catalog values. Fixing a model no longer requires
+		// editing + rebuilding the extension.
+		const override = resolveModelOverride(overrides, id);
 		if (override) {
 			if (override.contextWindow !== undefined)
 				entry.contextWindow = override.contextWindow;

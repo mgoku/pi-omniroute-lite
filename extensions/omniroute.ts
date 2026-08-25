@@ -106,8 +106,18 @@ const MODEL_OVERRIDES: Record<string, { contextWindow?: number; maxTokens?: numb
 };
 
 /** A contextWindow / maxTokens value is usable only if a positive finite number. */
-function plausibleWindow(v: unknown): number | undefined {
-	return typeof v === "number" && isFinite(v) && v > 0 ? v : undefined;
+/**
+ * Reject obviously-wrong context/max-token values. A value is "plausible"
+ * only when it is a finite positive number at least `min`. For context window
+ * we require >= MIN_CONTEXT_WINDOW (200000): recent models commonly ship at
+ * least that, so OmniRoute's generic fallback of 128000 (reported for every
+ * qwen, etc.) is treated as a missing/implausible value and falls through to
+ * the pi-ai catalog. maxTokens keeps the permissive default (any positive).
+ */
+const MIN_CONTEXT_WINDOW = 200_000;
+
+function plausibleWindow(v: unknown, min = 1): number | undefined {
+	return typeof v === "number" && isFinite(v) && v >= min ? v : undefined;
 }
 
 /**
@@ -186,6 +196,7 @@ interface PiCatalogModel {
 	contextWindow?: number;
 	maxTokens?: number;
 	input?: string[];
+	reasoning?: boolean;
 	thinkingLevelMap?: Record<string, string | null>;
 }
 
@@ -248,6 +259,7 @@ function loadPiCatalogMaps(): Record<string, PiCatalogModel> {
 					if (cw) entry.contextWindow = cw;
 					if (mt) entry.maxTokens = mt;
 					if (Array.isArray(m.input) && m.input.length > 0) entry.input = m.input;
+					if (m.reasoning === true) entry.reasoning = true;
 					const tlm: any = m.thinkingLevelMap;
 					if (tlm && typeof tlm === "object" && Object.values(tlm).some((v) => typeof v === "string"))
 						entry.thinkingLevelMap = tlm;
@@ -273,13 +285,17 @@ function loadPiCatalogMaps(): Record<string, PiCatalogModel> {
  * undefined when nothing matches. The candidate-name logic mirrors the id
  * variants pi's gateway actually uses: full id, alias-stripped root, last
  * segment, and suffix-stripped ("-free" / ":free" / ":free-high") so ids like
- * trk/qwen/qwen3.8-max-free reach the catalog's qwen3.8-max.
+ * trk/qwen/qwen3.8-max-free reach the catalog's qwen3.8-max. The MOST COMPLETE
+ * match wins (not first-match): different catalogs may omit a field another
+ * has (e.g. openrouter's "qwen/qwen3.8-max" has no thinkingLevelMap while the
+ * bare "qwen3.8-max" does), so we keep the entry with the most fields.
  */
 function catalogModelMeta(id: string): PiCatalogModel | undefined {
 	if (piCatalogMaps === undefined) piCatalogMaps = loadPiCatalogMaps();
 	const segs = id.split("/");
 	const names = [id, segs.slice(1).join("/"), segs[segs.length - 1]];
 	const candidates = new Set<string>();
+	let best: PiCatalogModel | undefined;
 	for (const name of names) {
 		candidates.add(name);
 		let cur = name;
@@ -292,9 +308,14 @@ function catalogModelMeta(id: string): PiCatalogModel | undefined {
 	}
 	for (const candidate of candidates) {
 		const entry = piCatalogMaps[candidate] ?? piCatalogMaps[candidate.toLowerCase()];
-		if (entry && Object.keys(entry).length > 0) return entry;
+		if (!entry || Object.keys(entry).length === 0) continue;
+		// Pick the most complete match: an id variant in a different catalog may
+		// lack a field another has (e.g. openrouter's "qwen/qwen3.8-max" has no
+		// thinkingLevelMap while the bare "qwen3.8-max" does), so first-match is
+		// wrong — take the entry with the most fields so nothing is dropped.
+		if (!best || Object.keys(entry).length > Object.keys(best).length) best = entry;
 	}
-	return undefined;
+	return best;
 }
 
 /**
@@ -531,8 +552,8 @@ function lookupUpstream(index: Map<string, any>, root: string): any | undefined 
 
 /** Patch one gateway row in place with normalized upstream metadata. */
 function applyUpstreamMeta(row: any, meta: UpstreamMeta): void {
-	if (typeof meta.contextWindow === "number") row.context_length = meta.contextWindow;
-	if (typeof meta.maxOutputTokens === "number") row.max_output_tokens = meta.maxOutputTokens;
+	if (typeof meta.contextWindow === "number") { row.context_length = meta.contextWindow; row.__upstream_cw = true; }
+	if (typeof meta.maxOutputTokens === "number") { row.max_output_tokens = meta.maxOutputTokens; row.__upstream_mt = true; }
 	if (Array.isArray(meta.inputModalities) && meta.inputModalities.length > 0)
 		row.input_modalities = meta.inputModalities;
 	if (typeof meta.name === "string" && meta.name) row.name = meta.name;
@@ -632,25 +653,31 @@ function toModels(data: any[]): any[] {
 
 		// --- contextWindow / maxTokens resolution ---------------------------
 		// Precedence (highest first):
-		//   3. pi-ai catalog (case 1 backstop — fills missing/invalid data)
-		//   2. gateway /v1/models (trusted only when plausible — case 3 guard)
-		//   1. pi default (omitted entirely; pi falls back to its own default)
-		// A manual override (case 3, lowest effort to set) is applied on top of
-		// all of the above at the end of this block via resolveModelOverride().
-		const gwCtx = plausibleWindow(m.context_length ?? m.max_input_tokens);
+		//   manual override (applied later) > upstream-enriched value (case 2,
+		//     written into the row in place before this runs) > raw gateway
+		//     /v1/models value (when plausible) > pi-ai catalog (case 1) > pi
+		//     default.
+		//
+		// The gateway value is real upstream data and beats the catalog when it is
+		// plausible. A context window is only plausible if >= MIN_CONTEXT_WINDOW
+		// (200000): OmniRoute frequently reports a generic 128000 for every model
+		// that is wrong, so that value is rejected and falls through to the
+		// catalog. A genuine small-context model not in pi's catalogs still keeps
+		// its gateway value (we don't drop it). Invalid/zero gateway values are
+		// rejected by plausibleWindow() and fall through to the catalog.
+		const gwCtxRaw = m.context_length ?? m.max_input_tokens;
+		// An upstream-enriched (case 2) value is trusted at any positive size;
+		// a raw gateway value must clear the context-window minimum.
+		const gwCtx = m.__upstream_cw ? plausibleWindow(gwCtxRaw) : plausibleWindow(gwCtxRaw, MIN_CONTEXT_WINDOW);
 		const gwMax = plausibleWindow(m.max_output_tokens ?? m.max_tokens);
 
 		// Case 1 backstop: inherit from pi-ai's own catalogs (same source pi
-		// trusts). Only fills gaps — never overrides a plausible gateway value.
+		// trusts). Fills the gap only when the gateway value wasn't plausible.
 		const catalog = catalogModelMeta(id);
-		if (gwCtx === undefined && catalog?.contextWindow !== undefined)
-			entry.contextWindow = catalog.contextWindow;
-		if (gwMax === undefined && catalog?.maxTokens !== undefined)
-			entry.maxTokens = catalog.maxTokens;
-		// A plausible gateway value beats an absent catalog value; only when the
-		// gateway gave nothing usable does the catalog value (set above) survive.
 		if (gwCtx !== undefined) entry.contextWindow = gwCtx;
+		else if (catalog?.contextWindow !== undefined) entry.contextWindow = catalog.contextWindow;
 		if (gwMax !== undefined) entry.maxTokens = gwMax;
+		else if (catalog?.maxTokens !== undefined) entry.maxTokens = catalog.maxTokens;
 
 		// Input modalities: trust the gateway if it declared anything usable;
 		// otherwise backfill from the pi-ai catalog (it lists text/image too).
@@ -664,7 +691,14 @@ function toModels(data: any[]): any[] {
 		entry.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 		if (m.capabilities?.tool_calling === false) entry.tool_calling = false;
-		const reasoning = !!(m.capabilities?.reasoning || m.capabilities?.thinking);
+		// The model can reason if the gateway says so, or — when the gateway is
+		// silent about it — if pi's catalog (our authoritative metadata source)
+		// declares it. An explicit gateway `false` is still respected.
+		const gatewayReasoningDeclared =
+			m.capabilities?.reasoning !== undefined || m.capabilities?.thinking !== undefined;
+		const reasoning =
+			!!(m.capabilities?.reasoning || m.capabilities?.thinking) ||
+			(!gatewayReasoningDeclared && catalog?.reasoning === true);
 		if (reasoning) entry.reasoning = true;
 
 		// Reasoning effort: a manual override wins, else derive from the gateway's

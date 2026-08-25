@@ -27,12 +27,17 @@ OpenAI-compatible provider.
   nothing, and pi's default `off/low/medium/high` applies.
 - **Catalog metadata backfill (case 1)** — when a model's gateway row has no
   usable `contextWindow` / `maxTokens` (upstream didn't provide it, or reported
-  an implausible/zero value), sync fills those fields — plus `input` modalities
+  an implausible value), sync fills those fields — plus `input` modalities
   and `thinkingLevelMap` — from pi's own built-in provider catalogs. This is
   the exact same source pi trusts for its own providers, so popular models get
-  sane values with no extra config and no network call. A plausible gateway
-  value always wins over the catalog; the catalog only fills gaps. Manual
-  overrides (below) win over both.
+  sane values with no extra config and no network call. The gateway value is
+  real upstream data and **beats the catalog when it is plausible**; the
+  catalog is the backstop for when it isn't. A context window is only
+  considered plausible if it is `>= 200000` (`MIN_CONTEXT_WINDOW`) — recent
+  models commonly ship at least that, so OmniRoute's generic fallback of 128000
+  (reported for every qwen, etc.) is rejected and the catalog's correct value
+  is used instead. A genuine small-context model not present in the catalogs
+  still keeps its gateway value. Manual overrides (below) win over both.
 - **Manual model overrides (case 3)** — instead of editing the extension to fix
   a model, add an `overrides` map to `~/.pi/agent/omniroute-upstreams.json`
   keyed by model id (see below). User overrides merge over the built-in
